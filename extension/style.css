@@ -1156,3 +1156,93 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
   opacity: 0.6;
   flex-shrink: 0;
 }
+
+/* ================================================================
+   WEEKLY FREQUENT PAGES
+   ================================================================ */
+
+/* Left column wrapper — weekly + open on top, flexible width */
+.main-column {
+  flex: 1;
+  min-width: 600px;
+}
+
+/* Weekly section styling */
+.weekly-section {
+  margin-bottom: 24px;
+}
+
+.weekly-note {
+  font-size: 11px;
+  color: var(--muted);
+  font-style: italic;
+  margin-bottom: 16px;
+  opacity: 0.8;
+}
+
+.weekly-missions {
+  /* Reuse missions layout */
+}
+
+.weekly-empty {
+  font-size: 13px;
+  color: var(--muted);
+  font-style: italic;
+  padding: 16px 0;
+  text-align: center;
+}
+
+/* Weekly card close button — larger clickable area */
+.weekly-card-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 6px;
+  border-radius: 4px;
+  opacity: 0.6;
+  transition: opacity 0.15s, color 0.15s, background 0.15s;
+  flex-shrink: 0;
+  margin-left: 8px;
+}
+
+.weekly-card-close svg {
+  width: 22px;
+  height: 22px;
+}
+
+.weekly-card-close:hover {
+  opacity: 1;
+  background: rgba(154, 145, 138, 0.1);
+  color: var(--status-abandoned);
+}
+
+/* Weekly page close button in chips */
+.weekly-page-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 6px;
+  border-radius: 4px;
+  opacity: 0.6;
+  transition: opacity 0.15s, color 0.15s, background 0.15s;
+  flex-shrink: 0;
+}
+
+.weekly-page-close svg {
+  width: 22px;
+  height: 22px;
+}
+
+.weekly-page-close:hover {
+  opacity: 1;
+  background: rgba(179, 90, 90, 0.08);
+  color: var(--status-abandoned);
+}

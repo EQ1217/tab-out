@@ -87,6 +87,68 @@ chrome.tabs.onUpdated.addListener(() => {
   updateBadge();
 });
 
+// ─── Tab activation tracking ──────────────────────────────────────────────────
+
+/**
+ * normalizeUrl(url)
+ *
+ * 简单的 URL 归一化（移除 hash、tracking 参数、尾斜杠）
+ * 与 app.js 中的 normalizeHistoryUrl 保持一致
+ */
+function normalizeUrl(url) {
+  try {
+    const u = new URL(url);
+    u.hash = '';
+    const trackingParams = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'fbclid', 'gclid', 'mc_cid', 'mc_eid'];
+    for (const param of trackingParams) u.searchParams.delete(param);
+    let result = u.href;
+    result = result.replace(/\/$/, '');
+    return result;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * trackTabActivation(tabId, url)
+ *
+ * 记录 tab 被激活（点击切换）的次数
+ */
+async function trackTabActivation(tabId, url) {
+  if (!url) return;
+
+  // 过滤掉非真实网页
+  if (url.startsWith('chrome://') ||
+     url.startsWith('chrome-extension://') ||
+      url.startsWith('about:') ||
+      url.startsWith('edge://') ||
+      url.startsWith('brave://')) {
+    return;
+  }
+
+  const normalized = normalizeUrl(url);
+  const key = `activations:${normalized}`;
+
+  try {
+    const { [key]: existing = 0 } = await chrome.storage.local.get(key);
+    await chrome.storage.local.set({ [key]: existing + 1 });
+  } catch (err) {
+    console.warn('[tab-out] Failed to track tab activation:', err);
+  }
+}
+
+// 监听 tab 激活事件（用户点击切换 tab）
+chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab?.url) {
+      await trackTabActivation(tabId, tab.url);
+    }
+  } catch (err) {
+    console.warn('[tab-out] Failed to get tab info:', err);
+  }
+});
+
 // ─── Initial run ─────────────────────────────────────────────────────────────
 
 // Run once immediately when the service worker first loads

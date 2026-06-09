@@ -693,6 +693,834 @@ function smartTitle(title, url) {
 
 
 /* ----------------------------------------------------------------
+   WEEKLY FREQUENT PAGES — Constants & Classification
+   ---------------------------------------------------------------- */
+
+const WEEKLY_HISTORY_DAYS = 7;
+const WEEKLY_CACHE_TTL_MS = 15 * 60 * 1000;
+const WEEKLY_MAX_RESULTS = 300;
+const WEEKLY_MIN_VISITS = 3;
+const WEEKLY_MAX_PAGES = 50;
+
+const WEEKLY_CATEGORY_RULES = [
+  { id: 'jobs', label: '招聘相关', keywords: ['招聘', '岗位', '职位', '面试', '简历', '内推', '猎聘', '拉勾', 'boss直聘', 'jobs', 'career', 'hiring', 'recruit', 'careers', 'job', '求职'], hostKeywords: ['zhipin.com', 'lagou.com', 'linkedin.com/jobs'] },
+  { id: 'ai', label: 'AI / LLM', keywords: ['ai', 'llm', 'gpt', 'claude', 'gemini', 'prompt', 'agent', '模型', '大模型', '人工智能', 'openai', 'anthropic', 'copilot'], hostKeywords: [] },
+  { id: 'dev', label: '开发相关', keywords: ['github', 'pull request', 'issue', 'docs', 'api', 'javascript', 'typescript', 'python', 'react', 'chrome extension', '开发', '代码', '接口', 'debug', 'commit', 'branch', 'npm', 'yarn', 'docker', 'deploy'], hostKeywords: ['github.com', 'stackoverflow.com', 'npmjs.com', 'developer.mozilla.org'] },
+  { id: 'docs', label: '文档 / 学习', keywords: ['docs', 'documentation', 'guide', 'tutorial', 'learn', 'course', '文档', '教程', '学习', 'wiki', 'handbook', 'reference'], hostKeywords: ['wikipedia.org'] },
+  { id: 'design', label: '设计相关', keywords: ['figma', 'design', 'ui', 'ux', 'prototype', '设计', '原型', 'sketch', 'wireframe'], hostKeywords: ['figma.com'] },
+  { id: 'shopping', label: '购物消费', keywords: ['cart', 'order', 'checkout', 'amazon', 'taobao', 'jd', 'tmall', '购物', '订单', '商品', '支付', 'purchase'], hostKeywords: ['amazon.com', 'taobao.com'] },
+  { id: 'media', label: '视频 / 娱乐', keywords: ['youtube', 'bilibili', 'netflix', 'video', 'music', 'podcast', '视频', '音乐', '播客', 'watch', 'streaming', 'anime'], hostKeywords: ['youtube.com', 'bilibili.com', 'netflix.com', 'spotify.com'] },
+  { id: 'social', label: '社交动态', keywords: ['twitter', 'x.com', 'reddit', 'linkedin', 'post', 'feed', '社交', '动态', 'thread', 'comment'], hostKeywords: ['x.com', 'reddit.com', 'linkedin.com'] },
+  { id: 'news', label: '新闻阅读', keywords: ['news', 'newsletter', 'substack', 'hacker news', '新闻', '资讯', '报道', '头条', 'breaking'], hostKeywords: ['news.ycombinator.com', 'substack.com'] },
+];
+
+const WEEKLY_EN_STOP = new Set(['the', 'and', 'for', 'with', 'from', 'home', 'login', 'search', 'official', 'page', 'app', 'www', 'this', 'that', 'what', 'how', 'why', 'not', 'are', 'was', 'has', 'had', 'but', 'can', 'all', 'you', 'your', 'our', 'its', 'his', 'her']);
+const WEEKLY_CJK_STOP = new Set(['首页', '登录', '搜索', '个人', '中心', '官方', '网站', '最新', '全部', '我的', '设置', '更多', '关于', '帮助']);
+
+const WEEKLY_STORAGE_KEYS = { cache: 'weeklyFrequentPages', prefs: 'weeklyPagePrefs' };
+
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;');
+}
+
+function escapeAttr(str) {
+  return String(str || '').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
+
+function getWeeklyHistoryRange() {
+  const endTime = Date.now();
+  return { startTime: endTime - WEEKLY_HISTORY_DAYS * 24 * 60 * 60 * 1000, endTime };
+}
+
+function isHistoryUrlAllowed(url) {
+  if (!url) return false;
+  return !url.startsWith('chrome://') && !url.startsWith('chrome-extension://') &&
+    !url.startsWith('about:') && !url.startsWith('edge://') && !url.startsWith('brave://') &&
+    !url.startsWith('file://');
+}
+
+function normalizeHistoryUrl(url) {
+  try {
+    const u = new URL(url);
+    u.hash = '';
+    const trackingParams = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'fbclid', 'gclid', 'mc_cid', 'mc_eid'];
+    for (const param of trackingParams) u.searchParams.delete(param);
+    let result = u.href;
+    result = result.replace(/\/$/, '');
+
+    // 对特定网站进行更激进的归一化（避免重复）
+    result = normalizeUrlForSite(result);
+
+    return result;
+  } catch {
+    return url;
+  }
+}
+
+function normalizeUrlForSite(url) {
+  try {
+    const u = new URL(url);
+
+    // 飞书系列：只保留应用主路径
+    if (u.hostname.includes('feishu.cn') || u.hostname.includes('larksuite.com') || u.hostname.includes('larkoffice.com')) {
+      // 飞书表格：https://bitable.feishu.cn/app/xxxxx/block/xxxxx -> https://bitable.feishu.cn/app/xxxxx
+      if (u.hostname.includes('bitable') || u.hostname.includes('table') || u.pathname.includes('/sheets/')) {
+        // 移除 sheet 参数（不同 sheets 的区别）
+        u.searchParams.delete('sheet');
+
+        if (u.pathname.includes('/app/')) {
+          const bitableMatch = u.pathname.match(/^\/app\/([A-Za-z0-9_-]+)/);
+          if (bitableMatch) {
+            return `${u.protocol}//${u.hostname}/app/${bitableMatch[1]}`;
+          }
+          return url; // 已经归一化到 app 层
+        }
+
+        // 飞书在线表格：https://bytedance.larkoffice.com/sheets/xxxxx?sheet=yyy -> https://bytedance.larkoffice.com/sheets/xxxxx
+        const sheetsMatch = u.pathname.match(/^\/sheets\/([A-Za-z0-9_-]+)/);
+        if (sheetsMatch) {
+          return `${u.protocol}//${u.hostname}/sheets/${sheetsMatch[1]}`;
+        }
+
+        return url;
+      }
+
+      // 飞书文档：https://xxx.feishu.cn/docx/yyyyy -> https://xxx.feishu.cn/docx/yyyyy
+      // 飞书文档的多页面：?blockId=zzzz -> 去除 blockId
+      if (u.pathname.includes('/docx/') || u.pathname.includes('/docs/')) {
+        u.searchParams.delete('blockId');
+        u.searchParams.delete('pageId');
+        return u.href;
+      }
+
+      return url;
+    }
+
+    // 火山方舟：console.volcengine.com/ark/... 只保留 ark 层
+    if (u.hostname.includes('volcengine.com') && u.pathname.includes('/ark/')) {
+      const arkMatch = u.pathname.match(/^\/ark\/([^/]+)/);
+      if (arkMatch) {
+        return `${u.protocol}//${u.hostname}/ark/${arkMatch[1]}`;
+      }
+    }
+
+    // GitHub：https://github.com/owner/repo/issues/123 -> https://github.com/owner/repo/issues
+    // https://github.com/owner/repo/blob/xxx -> https://github.com/owner/repo
+    if (u.hostname.includes('github.com')) {
+      const githubMatch = u.pathname.match(/^\/([^/]+\/[^/]+)/);
+      if (githubMatch) {
+        return `${u.protocol}//${u.hostname}/${githubMatch[1]}`;
+      }
+    }
+
+    return url;
+  } catch {
+    return url;
+  }
+}
+
+function fetchWeeklyHistoryPages() {
+  return new Promise((resolve) => {
+    const { startTime, endTime } = getWeeklyHistoryRange();
+    chrome.history.search({ text: '', startTime, endTime, maxResults: WEEKLY_MAX_RESULTS }, (items) => {
+      if (chrome.runtime.lastError) {
+        console.warn('[tab-out] History search failed:', chrome.runtime.lastError);
+        resolve([]);
+        return;
+      }
+
+      const allowedItems = items.filter(item => isHistoryUrlAllowed(item.url));
+
+      if (allowedItems.length === 0) {
+        resolve([]);
+        return;
+      }
+
+      countWeeklyVisitsForItems(allowedItems).then(visitsMap => {
+        const pages = allowedItems.map(item => {
+          const normalized = normalizeHistoryUrl(item.url);
+          const urlObj = new URL(item.url);
+          return {
+            url: item.url,
+            normalizedUrl: normalized,
+            title: item.title || '',
+            cleanTitle: cleanTitle(item.title || ''),
+            hostname: urlObj.hostname,
+            pathname: urlObj.pathname,
+            lastVisitTime: item.lastVisitTime,
+            visitCount: item.visitCount || 0,
+            weeklyVisits: visitsMap.get(normalized) || 0,
+          };
+        }).filter(p => p.weeklyVisits >= WEEKLY_MIN_VISITS);
+
+        // 调试输出：7天内所有网页的访问统计
+        console.log('=== 7天历史记录访问统计（按访问次数排序）===');
+        const allPagesStats = allowedItems.map(item => {
+          const normalized = normalizeHistoryUrl(item.url);
+          const urlObj = new URL(item.url);
+          return {
+            normalizedUrl: normalized,
+            title: item.title || '',
+            cleanTitle: cleanTitle(item.title || ''),
+            hostname: urlObj.hostname,
+            weeklyVisits: visitsMap.get(normalized) || 0,
+          };
+        });
+        // 按访问次数去重并排序
+        const statsByNormalized = new Map();
+        for (const p of allPagesStats) {
+          const existing = statsByNormalized.get(p.normalizedUrl);
+          if (!existing || p.weeklyVisits > existing.weeklyVisits) {
+            statsByNormalized.set(p.normalizedUrl, p);
+          }
+        }
+        const sortedStats = Array.from(statsByNormalized.values())
+          .sort((a, b) => b.weeklyVisits - a.weeklyVisits);
+        sortedStats.forEach((s, i) => {
+          console.log(`${i + 1}. [${s.weeklyVisits}次] ${s.cleanTitle || s.title}`);
+          console.log(`   URL: ${s.normalizedUrl}`);
+          console.log(`   Host: ${s.hostname}`);
+        });
+        console.log('=== 过滤阈值：≥', WEEKLY_MIN_VISITS, '次 ===');
+        console.log('=== 过滤后剩余:', pages.length, '个页面 ===');
+
+        resolve(pages);
+      });
+    });
+  });
+}
+
+function countWeeklyVisitsForItems(items) {
+  return new Promise((resolve) => {
+    const uniqueUrls = [...new Set(items.map(i => normalizeHistoryUrl(i.url)))];
+    const visitsMap = new Map();
+    const activationMap = new Map();
+    const loadVisitsMap = new Map();
+    let pending = uniqueUrls.length;
+
+    console.log('[tab-out] countWeeklyVisitsForItems - uniqueUrls:', uniqueUrls.length);
+
+    if (uniqueUrls.length === 0) {
+      resolve(visitsMap);
+      return;
+    }
+
+    const { startTime, endTime } = getWeeklyHistoryRange();
+
+    // 只统计用户主动打开的 transition 类型（页面加载次数）
+    const ACTIVE_TRANSITIONS = new Set([
+      'link',       // 点击链接
+      'typed',      // 直接输入网址
+      'generated',  // 生成（如地址栏补全）
+      'auto_bookmark', // 点击书签
+      'auto_subframe',  // 子框架（如 iframe）
+      'manual_subframe', // 手动子框架
+      'start_page',     // 启动页
+      'form_submit',    // 表单提交
+    ]);
+
+    // 第一步：从 storage 获取 tab 激活次数
+    chrome.storage.local.get(null, (data) => {
+      if (chrome.runtime.lastError) {
+        console.warn('[tab-out] Failed to read storage:', chrome.runtime.lastError);
+      } else {
+        console.log('[tab-out] storage keys count:', Object.keys(data || {}).length);
+        console.log('[tab-out] activation keys count:', Object.keys(data || {}).filter(k => k.startsWith('activations:')).length);
+
+        for (const url of uniqueUrls) {
+          const key = `activations:${url}`;
+          activationMap.set(url, data[key] || 0);
+        }
+      }
+
+      // 第二步：从 chrome.history 获取页面加载次数
+      for (const url of uniqueUrls) {
+        chrome.history.getVisits({ url }, (visits) => {
+          const inRangeVisits = (visits || []).filter(v =>
+            v.visitTime >= startTime && v.visitTime <= endTime &&
+            ACTIVE_TRANSITIONS.has(v.transition)
+          ).length;
+          loadVisitsMap.set(url, inRangeVisits);
+
+          pending--;
+          if (pending === 0) {
+            // 合并：加载次数 + 激活次数
+            for (const url of uniqueUrls) {
+              const loads = loadVisitsMap.get(url) || 0;
+              const activations = activationMap.get(url) || 0;
+              const total = loads + activations;
+              visitsMap.set(url, total);
+
+              console.log(`[tab-out] ${url.slice(0, 50)}: loads=${loads}, activations=${activations}, total=${total}`);
+            }
+
+            console.log('[tab-out] Final visitsMap sample:', Array.from(visitsMap.entries()).slice(0, 5));
+            resolve(visitsMap);
+          }
+        });
+      }
+    });
+  });
+}
+
+function tokenizeWeeklyText(text) {
+  if (!text) return [];
+
+  const tokens = [];
+
+  // 检测是否有中文字符
+  const hasCJK = /[一-鿿]/.test(text);
+  const lowerText = text.toLowerCase();
+
+  if (hasCJK) {
+    // 中文 n-gram 提取（2-4 字）
+    for (let i = 0; i < lowerText.length; i++) {
+      for (let n = 2; n <= 4 && i + n <= lowerText.length; n++) {
+        const gram = lowerText.substring(i, i + n);
+        if (!WEEKLY_CJK_STOP.has(gram) && gram.trim().length > 0) {
+          tokens.push(gram);
+        }
+      }
+    }
+
+    // 单字（排除停用）
+    for (let i = 0; i < lowerText.length; i++) {
+      const char = lowerText[i];
+      if (!WEEKLY_CJK_STOP.has(char) && /[一-鿿]/.test(char)) {
+        tokens.push(char);
+      }
+    }
+  }
+
+  // 英文分词
+  const words = lowerText.split(/[\s\-_]+/).filter(w => w.length > 1 && !WEEKLY_EN_STOP.has(w));
+  tokens.push(...words);
+
+  return tokens;
+}
+
+function extractWeeklyKeywords(page, scoreThreshold = 1) {
+  const textSources = [page.title || '', page.hostname || ''];
+  const allTokens = [];
+  const tokenCounts = new Map();
+
+  for (const text of textSources) {
+    const tokens = tokenizeWeeklyText(text);
+    allTokens.push(...tokens);
+  }
+
+  for (const token of allTokens) {
+    tokenCounts.set(token, (tokenCounts.get(token) || 0) + 1);
+  }
+
+  return [...tokenCounts.entries()]
+    .filter(([token, count]) => count >= scoreThreshold)
+    .sort((a, b) => b[1] - a[1])
+    .map(([token, count]) => ({ token, count }));
+}
+
+function scoreWeeklyCategoryRule(rule, page) {
+  let score = 0;
+  const lowerTitle = (page.title || '').toLowerCase();
+  const lowerHostname = (page.hostname || '').toLowerCase();
+  const lowerPath = (page.pathname || '').toLowerCase();
+
+  for (const kw of rule.keywords) {
+    const kwLower = kw.toLowerCase();
+    if (lowerTitle.includes(kwLower)) score += 3;
+    if (lowerPath.includes(kwLower)) score += 2;
+  }
+
+  for (const hostKw of rule.hostKeywords) {
+    if (lowerHostname.includes(hostKw.toLowerCase())) score += 4;
+  }
+
+  return score;
+}
+
+function classifyWeeklyPage(page) {
+  let bestMatch = null;
+  let bestScore = 0;
+
+  for (const rule of WEEKLY_CATEGORY_RULES) {
+    const score = scoreWeeklyCategoryRule(rule, page);
+    if (score > bestScore) {
+      bestScore = score;
+      bestMatch = { categoryId: `rule:${rule.id}`, label: rule.label, score };
+    }
+  }
+
+  return bestMatch;
+}
+
+function generateWeeklyGroupLabel(keyword) {
+  const kw = keyword.toLowerCase();
+
+  if (kw.includes('招聘') || kw.includes('job') || kw.includes('career')) return '招聘相关';
+  if (kw.includes('ai') || kw.includes('llm') || kw.includes('gpt') || kw.includes('模型')) return 'AI / LLM';
+  if (kw.includes('开发') || kw.includes('代码') || kw.includes('dev')) return '开发相关';
+  if (kw.includes('文档') || kw.includes('docs') || kw.includes('教程')) return '文档 / 学习';
+  if (kw.includes('设计') || kw.includes('ui') || kw.includes('ux')) return '设计相关';
+  if (kw.includes('购物') || kw.includes('订单') || kw.includes('商品')) return '购物消费';
+  if (kw.includes('视频') || kw.includes('bilibili') || kw.includes('youtube')) return '视频 / 娱乐';
+  if (kw.includes('社交') || kw.includes('动态') || kw.includes('feed')) return '社交动态';
+  if (kw.includes('新闻') || kw.includes('news') || kw.includes('资讯')) return '新闻阅读';
+
+  return `${keyword} 相关`;
+}
+
+function buildKeywordClusters(pages) {
+  if (pages.length === 0) return [];
+
+  const tokenToPages = new Map();
+  for (const page of pages) {
+    const keywords = extractWeeklyKeywords(page, 1);
+    for (const { token } of keywords) {
+      if (!tokenToPages.has(token)) tokenToPages.set(token, []);
+      tokenToPages.get(token).push(page);
+    }
+  }
+
+  const assignments = new Map();
+  const assigned = new Set();
+  const sortedTokens = [...tokenToPages.entries()]
+    .filter(([token, pageList]) => pageList.length >= 2)
+    .sort((a, b) => b[1].length - a[1].length);
+
+  for (const [token, pageList] of sortedTokens) {
+    const unassignedPages = pageList.filter(p => !assigned.has(p.normalizedUrl));
+    if (unassignedPages.length >= 2) {
+      const clusterId = `kw:${token}`;
+      assignments.set(clusterId, {
+        id: clusterId,
+        autoLabel: generateWeeklyGroupLabel(token),
+        label: generateWeeklyGroupLabel(token),
+        pages: unassignedPages,
+        score: unassignedPages.reduce((s, p) => s + (p.weeklyVisits || 1), 0),
+        source: 'cluster',
+      });
+      for (const p of unassignedPages) assigned.add(p.normalizedUrl);
+    }
+  }
+
+  return Array.from(assignments.values());
+}
+
+function buildWeeklyFrequentGroups(pages) {
+  if (!pages || pages.length === 0) return [];
+  const grouped = {};
+  const assigned = new Set();
+
+  for (const page of pages) {
+    // 只保留高频页面（≥10次）
+    if ((page.weeklyVisits || 0) < WEEKLY_MIN_VISITS && page.source !== 'manual') {
+      continue;
+    }
+
+    const match = classifyWeeklyPage(page);
+    if (match) {
+      const cid = match.categoryId;
+      if (!grouped[cid]) grouped[cid] = { id: cid, autoLabel: match.label, label: match.label, pages: [], source: 'rule' };
+      grouped[cid].pages.push(page);
+      grouped[cid].score = (grouped[cid].score || 0) + match.score;
+      assigned.add(page.normalizedUrl);
+    }
+  }
+
+  const unclassified = pages.filter(p => !assigned.has(p.normalizedUrl) && ((p.weeklyVisits || 0) >= WEEKLY_MIN_VISITS || p.source === 'manual'));
+  const clusters = buildKeywordClusters(unclassified);
+  for (const cl of clusters) {
+    grouped[cl.id] = cl;
+    for (const page of cl.pages) assigned.add(page.normalizedUrl);
+  }
+
+  const leftOver = pages.filter(p => !assigned.has(p.normalizedUrl) && ((p.weeklyVisits || 0) >= WEEKLY_MIN_VISITS || p.source === 'manual'));
+  if (leftOver.length > 0) {
+    grouped['other'] = {
+      id: 'other',
+      autoLabel: 'Other frequent pages',
+      label: 'Other frequent pages',
+      pages: leftOver,
+      score: leftOver.reduce((s, p) => s + (p.weeklyVisits || 1), 0),
+      source: 'other',
+    };
+  }
+
+  const result = [];
+  for (const group of Object.values(grouped)) {
+    const titleToBestPage = new Map();
+    for (const page of group.pages) {
+      const titleKey = page.cleanTitle || page.title || "";
+      const existing = titleToBestPage.get(titleKey);
+      const isBetter = !existing ||
+                     page.source === 'manual' ||
+                     (page.weeklyVisits || 0) > (existing.weeklyVisits || 0) ||
+                     ((page.weeklyVisits || 0) === (existing.weeklyVisits || 0) && page.lastVisitTime > existing.lastVisitTime);
+      if (isBetter) {
+        titleToBestPage.set(titleKey, page);
+      }
+    }
+    const bestPages = Array.from(titleToBestPage.values());
+    const totalVisits = bestPages.reduce((s, p) => s + (p.weeklyVisits || 0), 0);
+    result.push({
+      id: group.id,
+      autoLabel: group.autoLabel,
+      label: group.label,
+      pages: bestPages,
+      score: totalVisits,
+      source: group.source,
+    });
+  }
+
+  return result.sort((a, b) => (b.score || 0) - (a.score || 0));
+}
+
+function sortWeeklyGroups(groups) {
+  return groups.sort((a, b) => (b.score || 0) - (a.score || 0));
+}
+
+function sortWeeklyPages(pages) {
+  return pages.sort((a, b) => (b.weeklyVisits || 0) - (a.weeklyVisits || 0) ||
+                              b.lastVisitTime - a.lastVisitTime);
+}
+
+/* ----------------------------------------------------------------
+   WEEKLY STORAGE HELPERS
+   ---------------------------------------------------------------- */
+
+function getWeeklyPagePrefs() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get([WEEKLY_STORAGE_KEYS.prefs], (result) => {
+      const prefs = result[WEEKLY_STORAGE_KEYS.prefs] || {
+        customLabels: {},
+        manualUrls: {},
+        urlToCategory: {},
+        removedCategories: [],
+      };
+      resolve(prefs);
+    });
+  });
+}
+
+function saveWeeklyPagePrefs(prefs) {
+  return new Promise((resolve) => {
+    chrome.storage.local.set({ [WEEKLY_STORAGE_KEYS.prefs]: prefs }, () => {
+      resolve();
+    });
+  });
+}
+
+function getWeeklyFrequentCache() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get([WEEKLY_STORAGE_KEYS.cache], (result) => {
+      const cache = result[WEEKLY_STORAGE_KEYS.cache];
+      if (!cache) {
+        resolve(null);
+        return;
+      }
+      const now = Date.now();
+      if (cache.timestamp && (now - cache.timestamp) < WEEKLY_CACHE_TTL_MS) {
+        resolve(cache.data);
+      } else {
+        resolve(null);
+      }
+    });
+  });
+}
+
+function saveWeeklyFrequentCache(data) {
+  return new Promise((resolve) => {
+    chrome.storage.local.set({
+      [WEEKLY_STORAGE_KEYS.cache]: {
+        timestamp: Date.now(),
+        data: data,
+      },
+    }, () => {
+      resolve();
+    });
+  });
+}
+
+function applyWeeklyPrefs(groups, prefs) {
+  const result = [];
+
+  for (const group of groups) {
+    // 过滤已删除的分类
+    if (prefs.removedCategories && prefs.removedCategories.includes(group.id)) {
+      continue;
+    }
+
+    const customLabel = prefs.customLabels[group.id];
+    const updatedGroup = {
+      ...group,
+      label: customLabel || group.label,
+      pages: sortWeeklyPages([...group.pages]),
+    };
+
+    // 添加手动 URL
+    for (const [url, catId] of Object.entries(prefs.urlToCategory)) {
+      if (catId === group.id && prefs.manualUrls[url]) {
+        const manualPage = {
+          ...prefs.manualUrls[url],
+          url: url,
+          normalizedUrl: normalizeHistoryUrl(url),
+          source: 'manual',
+        };
+        updatedGroup.pages.push(manualPage);
+      }
+    }
+
+    updatedGroup.pages = sortWeeklyPages(updatedGroup.pages);
+    updatedGroup.score = updatedGroup.pages.reduce((s, p) => s + (p.weeklyVisits || 1), 0);
+    result.push(updatedGroup);
+  }
+
+  // 添加只有手动 URL 的分类
+  const catsWithManuals = new Set(Object.values(prefs.urlToCategory));
+  for (const catId of catsWithManuals) {
+    if (result.some(g => g.id === catId)) continue;
+
+    const manualPages = [];
+    for (const [url, assignedCatId] of Object.entries(prefs.urlToCategory)) {
+      if (assignedCatId === catId && prefs.manualUrls[url]) {
+        const manualPage = {
+          ...prefs.manualUrls[url],
+          url: url,
+          normalizedUrl: normalizeHistoryUrl(url),
+          source: 'manual',
+        };
+        manualPages.push(manualPage);
+      }
+    }
+
+    if (manualPages.length > 0) {
+      result.push({
+        id: catId,
+        autoLabel: catId.startsWith('rule:') ? catId.slice(5) : catId,
+        label: prefs.customLabels[catId] || catId,
+        pages: sortWeeklyPages(manualPages),
+        score: manualPages.reduce((s, p) => s + (p.weeklyVisits || 1), 0),
+        source: 'manual',
+      });
+    }
+  }
+
+  return sortWeeklyGroups(result);
+}
+
+function mergeWeeklyPrefs(existing, updates) {
+  const merged = { ...existing };
+
+  if (updates.customLabels) {
+    merged.customLabels = { ...merged.customLabels, ...updates.customLabels };
+  }
+
+  if (updates.manualUrls) {
+    merged.manualUrls = { ...merged.manualUrls, ...updates.manualUrls };
+  }
+
+  if (updates.urlToCategory) {
+    merged.urlToCategory = { ...merged.urlToCategory, ...updates.urlToCategory };
+  }
+
+  if (updates.removedCategories) {
+    merged.removedCategories = updates.removedCategories;
+  }
+
+  return merged;
+}
+
+function deleteWeeklyGroup(groupId) {
+  return getWeeklyPagePrefs().then(prefs => {
+    const removed = prefs.removedCategories || [];
+    if (!removed.includes(groupId)) {
+      removed.push(groupId);
+    }
+    prefs.removedCategories = removed;
+    return saveWeeklyPagePrefs(prefs);
+  });
+}
+
+function removeWeeklyUrl(url) {
+  return getWeeklyPagePrefs().then(prefs => {
+    const normalized = normalizeHistoryUrl(url);
+    delete prefs.manualUrls[normalized];
+    delete prefs.urlToCategory[normalized];
+    return saveWeeklyPagePrefs(prefs);
+  });
+}
+
+function saveWeeklyGroupTitle(groupId, newLabel) {
+  return getWeeklyPagePrefs().then(prefs => {
+    prefs.customLabels = prefs.customLabels || {};
+    prefs.customLabels[groupId] = newLabel;
+    return saveWeeklyPagePrefs(prefs);
+  });
+}
+
+function addWeeklyUrlToCategory(url, categoryId) {
+  return getWeeklyPagePrefs().then(prefs => {
+    const normalized = normalizeHistoryUrl(url);
+    prefs.manualUrls = prefs.manualUrls || {};
+    prefs.urlToCategory = prefs.urlToCategory || {};
+
+    prefs.manualUrls[normalized] = {
+      title: url,
+      cleanTitle: cleanTitle(url),
+      hostname: new URL(url).hostname,
+      pathname: new URL(url).pathname,
+      lastVisitTime: Date.now(),
+      weeklyVisits: 1,
+    };
+    prefs.urlToCategory[normalized] = categoryId;
+
+    return saveWeeklyPagePrefs(prefs);
+  });
+}
+
+/* ----------------------------------------------------------------
+   WEEKLY FETCH MAIN ENTRY
+   ---------------------------------------------------------------- */
+
+async function getWeeklyFrequentData(forceRefresh = false) {
+  if (!forceRefresh) {
+    const cached = await getWeeklyFrequentCache();
+    if (cached) {
+      return cached;
+    }
+  }
+
+  const pages = await fetchWeeklyHistoryPages();
+  const rawGroups = buildWeeklyFrequentGroups(pages);
+  const prefs = await getWeeklyPagePrefs();
+  const groups = applyWeeklyPrefs(rawGroups, prefs);
+
+  await saveWeeklyFrequentCache(groups);
+  return groups;
+}
+
+/* ----------------------------------------------------------------
+   WEEKLY RENDERING
+   ---------------------------------------------------------------- */
+
+function renderWeeklyFrequentSection(groups) {
+  const section = document.getElementById('weeklyFrequentSection');
+  const countEl = document.getElementById('weeklyFrequentCount');
+  const missionsEl = document.getElementById('weeklyFrequentMissions');
+  const emptyEl = document.getElementById('weeklyFrequentEmpty');
+
+  if (!section || !missionsEl) return;
+
+  if (!groups || groups.length === 0) {
+    section.style.display = 'none';
+    return;
+  }
+
+  const totalGroups = groups.length;
+  const totalPages = groups.reduce((s, g) => s + g.pages.length, 0);
+
+  section.style.display = 'block';
+  if (countEl) countEl.textContent = `${totalGroups} groups · ${totalPages} pages`;
+
+  missionsEl.innerHTML = groups.map(group => renderWeeklyFrequentCard(group)).join('');
+
+  if (emptyEl) emptyEl.style.display = 'none';
+}
+
+function renderWeeklyFrequentCard(group) {
+  const safeId = escapeAttr(group.id);
+  const safeLabel = escapeHtml(group.label);
+  const pageCount = group.pages.length;
+  const totalVisits = group.score || group.pages.reduce((s, p) => s + (p.weeklyVisits || 1), 0);
+
+  const pagesHtml = group.pages.map(page => renderWeeklyPageChip(page, group.id)).join('');
+
+  return `
+<div class="mission-card has-neutral-bar" data-group-id="${safeId}">
+  <div class="mission-content">
+    <div class="mission-top">
+      <span class="mission-name">${safeLabel}</span>
+      <span class="mission-tag neutral">${totalVisits} visits</span>
+      <button class="weekly-card-close" data-action="delete-weekly-group" data-group-id="${safeId}" title="Delete this category">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" />
+        </svg>
+      </button>
+    </div>
+    <div class="mission-summary">${pageCount} pages</div>
+    <div class="mission-pages">
+      ${pagesHtml}
+    </div>
+    <div class="actions">
+      <button class="action-btn" data-action="edit-weekly-group-title" data-group-id="${safeId}" data-current-label="${escapeAttr(group.label)}">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L10.582 16.07a4.5 4.5 0 0 1-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 0 1 1.13-1.897l8.935-8.935Z" />
+        </svg>
+        Rename
+      </button>
+      <button class="action-btn" data-action="show-add-weekly-url" data-group-id="${safeId}" title="Add a URL to this category">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+        </svg>
+        Add URL
+      </button>
+    </div>
+    <div class="add-url-form" id="add-url-form-${safeId}" style="display:none">
+      <div class="mission-pages">
+        <div class="page-chip">
+          <input type="text" class="add-url-input" id="add-url-input-${safeId}" placeholder="Paste URL here..." style="flex:1;min-width:0;padding:4px 8px;font-size:13px;border:1px solid var(--warm-gray);border-radius:4px;">
+          <button class="chip-action chip-save" data-action="add-weekly-url" data-group-id="${safeId}" title="Add">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+            </svg>
+          </button>
+          <button class="chip-action chip-close" data-action="cancel-add-weekly-url" data-group-id="${safeId}" title="Cancel">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>`;
+}
+
+function renderWeeklyPageChip(page, groupId) {
+  const safeUrl = escapeAttr(page.url);
+  const safeNormalizedUrl = escapeAttr(page.normalizedUrl);
+  const safeTitle = escapeHtml(page.cleanTitle || page.title || page.url);
+  const safeGroupId = escapeAttr(groupId);
+  const weeklyVisits = page.weeklyVisits || 1;
+
+  let domain = '';
+  try { domain = new URL(page.url).hostname; } catch {}
+
+  const faviconUrl = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=16` : '';
+
+  return `
+<div class="page-chip clickable" data-action="open-weekly-url" data-url="${safeUrl}" title="${safeTitle}">
+  ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : ''}
+  <span class="chip-text">${safeTitle}</span>
+  ${weeklyVisits > 1 ? `<span style="font-size:11px;color:var(--muted);margin-left:6px;">${weeklyVisits}x</span>` : ''}
+  <div class="chip-actions">
+    <button class="weekly-page-close" data-action="remove-weekly-url" data-url="${safeNormalizedUrl}" data-group-id="${safeGroupId}" title="Remove this URL">
+      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" />
+      </svg>
+    </button>
+  </div>
+</div>`;
+}
+
+
+/* ----------------------------------------------------------------
    SVG ICON STRINGS
    ---------------------------------------------------------------- */
 const ICONS = {
@@ -1026,6 +1854,14 @@ async function renderStaticDashboard() {
   if (greetingEl) greetingEl.textContent = getGreeting();
   if (dateEl)     dateEl.textContent     = getDateDisplay();
 
+  // 测试 storage 读写
+  chrome.storage.local.get('test-key', (data) => {
+    console.log('[tab-out] storage test - read:', data);
+    chrome.storage.local.set({ 'test-key': 'test-value-' + Date.now() }, () => {
+      console.log('[tab-out] storage test - wrote');
+    });
+  });
+
   // --- Fetch tabs ---
   await fetchOpenTabs();
   const realTabs = getRealTabs();
@@ -1141,6 +1977,14 @@ async function renderStaticDashboard() {
 
     return b.tabs.length - a.tabs.length;
   });
+
+  // --- Render weekly frequent pages ---
+  try {
+    const weeklyGroups = await getWeeklyFrequentData();
+    renderWeeklyFrequentSection(weeklyGroups);
+  } catch (err) {
+    console.warn('[tab-out] Failed to render weekly frequent pages:', err);
+  }
 
   // --- Render domain cards ---
   const openTabsSection      = document.getElementById('openTabsSection');
@@ -1429,6 +2273,332 @@ document.addEventListener('click', async (e) => {
     });
 
     showToast('All tabs closed. Fresh start.');
+    return;
+  }
+
+  // ---- Weekly: open URL in new tab ----
+  if (action === 'open-weekly-url') {
+    const url = actionEl.dataset.url;
+    if (url) {
+      // 尝试找到已打开的 tab 并 focus，否则打开新 tab
+      const allTabs = await chrome.tabs.query({});
+      const match = allTabs.find(t => t.url === url);
+      if (match) {
+        await chrome.tabs.update(match.id, { active: true });
+        await chrome.windows.update(match.windowId, { focused: true });
+      } else {
+        await chrome.tabs.create({ url });
+      }
+    }
+    return;
+  }
+
+  // ---- Weekly: refresh history ----
+  if (action === 'refresh-weekly-history') {
+    try {
+      const groups = await getWeeklyFrequentData(true);
+      renderWeeklyFrequentSection(groups);
+      showToast('Weekly pages refreshed');
+    } catch (err) {
+      console.warn('[tab-out] Failed to refresh weekly pages:', err);
+      showToast('Refresh failed');
+    }
+    return;
+  }
+
+  // ---- Weekly: edit group title ----
+  if (action === 'edit-weekly-group-title') {
+    const groupId = actionEl.dataset.groupId;
+    const currentLabel = actionEl.dataset.currentLabel;
+    if (!groupId || !card) return;
+
+    const nameEl = card.querySelector('.mission-name');
+    if (!nameEl) return;
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = currentLabel || '';
+    input.className = 'edit-title-input';
+    input.style.cssText = 'font-size:15px;font-weight:600;color:var(--ink);border:1px solid var(--accent-amber);border-radius:4px;padding:4px 8px;flex:1;';
+
+    const actionsEl = card.querySelector('.actions');
+    if (actionsEl) {
+      actionsEl.innerHTML = `
+        <button class="action-btn" data-action="save-weekly-group-title" data-group-id="${escapeAttr(groupId)}">
+          Save
+        </button>
+        <button class="action-btn" data-action="cancel-weekly-group-title" data-group-id="${escapeAttr(groupId)}" data-original-label="${escapeAttr(currentLabel)}">
+          Cancel
+        </button>
+      `;
+    }
+
+    nameEl.replaceWith(input);
+    input.focus();
+    input.select();
+
+    // Handle Enter key
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        input.dispatchEvent(new Event('blur'));
+      } else if (e.key === 'Escape') {
+        const cancelBtn = card.querySelector('[data-action="cancel-weekly-group-title"]');
+        if (cancelBtn) cancelBtn.click();
+      }
+    });
+
+    // Auto-save on blur
+    input.addEventListener('blur', async () => {
+      const newLabel = input.value.trim();
+      if (newLabel && newLabel !== currentLabel) {
+        await saveWeeklyGroupTitle(groupId, newLabel);
+        const nameElNew = document.createElement('span');
+        nameElNew.className = 'mission-name';
+        nameElNew.textContent = newLabel;
+        input.replaceWith(nameElNew);
+        actionsEl.innerHTML = `
+          <button class="action-btn" data-action="edit-weekly-group-title" data-group-id="${escapeAttr(groupId)}" data-current-label="${escapeAttr(newLabel)}">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L10.582 16.07a4.5 4.5 0 0 1-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 0 1 1.13-1.897l8.935-8.935Z" />
+            </svg>
+            Rename
+          </button>
+          <button class="action-btn" data-action="show-add-weekly-url" data-group-id="${escapeAttr(groupId)}" title="Add a URL to this category">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+            </svg>
+            Add URL
+          </button>
+        `;
+      } else {
+        // Revert to original
+        const nameElNew = document.createElement('span');
+        nameElNew.className = 'mission-name';
+        nameElNew.textContent = currentLabel;
+        input.replaceWith(nameElNew);
+        actionsEl.innerHTML = `
+          <button class="action-btn" data-action="edit-weekly-group-title" data-group-id="${escapeAttr(groupId)}" data="current-label="${escapeAttr(currentLabel)}">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L10.582 16.07a4.5 4.5 0 0 1-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 0 1 1.13-1.897l8.935-8.935Z" />
+            </svg>
+            Rename
+          </button>
+          <button class="action-btn" data-action="show-add-weekly-url" data-group-id="${escapeAttr(groupId)}" title="Add a URL to this category">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+            </svg>
+            Add URL
+          </button>
+        `;
+      }
+    });
+
+    return;
+  }
+
+  // ---- Weekly: save group title ----
+  if (action === 'save-weekly-group-title') {
+    const groupId = actionEl.dataset.groupId;
+    if (!groupId || !card) return;
+
+    const input = card.querySelector('input.edit-title-input');
+    if (!input) return;
+
+    const newLabel = input.value.trim();
+    if (newLabel) {
+      await saveWeeklyGroupTitle(groupId, newLabel);
+      showToast('Title saved');
+    }
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'mission-name';
+    nameEl.textContent = newLabel;
+    input.replaceWith(nameEl);
+
+    const actionsEl = card.querySelector('.actions');
+    if (actionsEl) {
+      actionsEl.innerHTML = `
+        <button class="action-btn" data-action="edit-weekly-group-title" data-group-id="${escapeAttr(groupId)}" data-current-label="${escapeAttr(newLabel)}">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L10.582 16.07a4.5 4.5 0 0 1-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 0 1 1.13-1.897l8.935-8.935Z" />
+          </svg>
+          Rename
+        </button>
+        <button class="action-btn" data-action="show-add-weekly-url" data-group-id="${escapeAttr(groupId)}" title="Add a URL to this category">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+          </svg>
+          Add URL
+        </button>
+      `;
+    }
+
+    return;
+  }
+
+  // ---- Weekly: cancel group title edit ----
+  if (action === 'cancel-weekly-group-title') {
+    const groupId = actionEl.dataset.groupId;
+    const originalLabel = actionEl.dataset.originalLabel;
+    if (!groupId || !card) return;
+
+    const input = card.querySelector('input.edit-title-input');
+    if (!input) return;
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'mission-name';
+    nameEl.textContent = originalLabel || '';
+    input.replaceWith(nameEl);
+
+    const actionsEl = card.querySelector('.actions');
+    if (actionsEl) {
+      actionsEl.innerHTML = `
+        <button class="action-btn" data-action="edit-weekly-group-title" data-group-id="${escapeAttr(groupId)}" data-current-label="${escapeAttr(originalLabel)}">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L10.582 16.07a4.5 4.5 0 0 1-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 0 1 1.13-1.897l8.935-8.935Z" />
+          </svg>
+          Rename
+        </button>
+        <button class="action-btn" data-action="show-add-weekly-url" data-group-id="${escapeAttr(groupId)}" title="Add a URL to this category">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+          </svg>
+          Add URL
+        </button>
+      `;
+    }
+
+    return;
+  }
+
+  // ---- Weekly: show add URL form ----
+  if (action === 'show-add-weekly-url') {
+    const groupId = actionEl.dataset.groupId;
+    if (!groupId || !card) return;
+
+    const formEl = card.querySelector(`.add-url-form`);
+    if (formEl) {
+      formEl.style.display = 'block';
+      const input = formEl.querySelector('input');
+      if (input) {
+        input.focus();
+        input.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') {
+            const addBtn = formEl.querySelector('[data-action="add-weekly-url"]');
+            if (addBtn) addBtn.click();
+          } else if (e.key === 'Escape') {
+            const cancelBtn = formEl.querySelector('[data-action="cancel-add-weekly-url"]');
+            if (cancelBtn) cancelBtn.click();
+          }
+        });
+      }
+    }
+
+    return;
+  }
+
+  // ---- Weekly: add URL to category ----
+  if (action === 'add-weekly-url') {
+    const groupId = actionEl.dataset.groupId;
+    if (!groupId || !card) return;
+
+    const input = card.querySelector('input.add-url-input');
+    if (!input) return;
+
+    const url = input.value.trim();
+    if (!url) {
+      showToast('Please enter a URL');
+      return;
+    }
+
+    // Validate URL format
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(url);
+    } catch {
+      // Try adding protocol
+      try {
+        parsedUrl = new URL('https://' + url);
+      } catch {
+        showToast('Invalid URL format');
+        return;
+      }
+    }
+
+    await addWeeklyUrlToCategory(parsedUrl.href, groupId);
+    showToast('URL added');
+
+    // Re-render the section
+    const groups = await getWeeklyFrequentData(true);
+    renderWeeklyFrequentSection(groups);
+
+    return;
+  }
+
+  // ---- Weekly: cancel add URL ----
+  if (action === 'cancel-add-weekly-url') {
+    const groupId = actionEl.dataset.groupId;
+    if (!groupId || !card) return;
+
+    const formEl = card.querySelector(`.add-url-form`);
+    if (formEl) {
+      formEl.style.display = 'none';
+      const input = formEl.querySelector('input');
+      if (input) input.value = '';
+    }
+
+    return;
+  }
+
+  // ---- Weekly: delete category ----
+  if (action === 'delete-weekly-group') {
+    const groupId = actionEl.dataset.groupId;
+    if (!groupId || !card) return;
+
+    await deleteWeeklyGroup(groupId);
+
+    // Animate card out
+    playCloseSound();
+    animateCardOut(card);
+
+    showToast('Category deleted');
+
+    // Re-render the section
+    setTimeout(async () => {
+      const groups = await getWeeklyFrequentData(true);
+      renderWeeklyFrequentSection(groups);
+    }, 400);
+
+    return;
+  }
+
+  // ---- Weekly: remove URL ----
+  if (action === 'remove-weekly-url') {
+    const url = actionEl.dataset.url;
+    if (!url) return;
+
+    await removeWeeklyUrl(url);
+
+    // Find and remove the chip row
+    const chip = actionEl.closest('.page-chip');
+    if (chip) {
+      chip.style.transition = 'opacity 0.2s, transform 0.2s';
+      chip.style.opacity = '0';
+      chip.style.transform = 'scale(0.8)';
+      setTimeout(() => {
+        chip.remove();
+        // If card now has no pages, remove it too
+        if (card && card.querySelectorAll('.page-chip').length === 0) {
+          animateCardOut(card);
+          setTimeout(async () => {
+            const groups = await getWeeklyFrequentData(true);
+            renderWeeklyFrequentSection(groups);
+          }, 400);
+        }
+      }, 200);
+    }
+
+    showToast('URL removed');
     return;
   }
 });

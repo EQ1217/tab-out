@@ -54,14 +54,27 @@
        ================================================================ -->
   <div class="dashboard-columns" id="dashboardColumns">
 
-    <!-- LEFT COLUMN: Open tabs -->
-    <div class="active-section" id="openTabsSection" style="display:none">
-      <div class="section-header">
-        <h2 id="openTabsSectionTitle">Right now</h2>
-        <div class="section-line"></div>
-        <div class="section-count" id="openTabsSectionCount"></div>
+    <!-- LEFT COLUMN: weekly frequent pages + open tabs -->
+    <div class="main-column" id="mainColumn">
+      <div class="weekly-section" id="weeklyFrequentSection" style="display:none">
+        <div class="section-header">
+          <h2>High frequency this week</h2>
+          <div class="section-line"></div>
+          <div class="section-count" id="weeklyFrequentCount"></div>
+        </div>
+        <div class="weekly-note">Grouped locally from your last 7 days of history. Nothing leaves this browser.</div>
+        <div class="missions weekly-missions" id="weeklyFrequentMissions"></div>
+        <div class="weekly-empty" id="weeklyFrequentEmpty" style="display:none"></div>
       </div>
-      <div class="missions" id="openTabsMissions"></div>
+
+      <div class="active-section" id="openTabsSection" style="display:none">
+        <div class="section-header">
+          <h2 id="openTabsSectionTitle">Right now</h2>
+          <div class="section-line"></div>
+          <div class="section-count" id="openTabsSectionCount"></div>
+        </div>
+        <div class="missions" id="openTabsMissions"></div>
+      </div>
     </div>
 
     <!-- RIGHT COLUMN: Saved for Later checklist -->
