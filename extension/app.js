@@ -1132,9 +1132,9 @@ function extractGroupLabelFromTitle(title) {
   const cleanTitle = title
     .replace(/\s*[-–·]\s*(GitHub|YouTube|Twitter|X|LinkedIn|Reddit|Medium|Notion|Figma|Slack|Discord|ChatGPT|Claude).*$/gi, '')
     .replace(/\s*[-–·]\s*(Docs|Documentation|Guide|Tutorial|Help|Support).*$/gi, '')
-    .replace(/\s*[-–·]\s*\d{4}$/gi, )
-    .replace(/\s*\(\d+\)$/gi, )
-    .replace(/\s*[-–·]\s*\d+.*$/gi, )
+    .replace(/\s*[-–·]\s*\d{4}$/gi, '')
+    .replace(/\s*\(\d+\)$/gi, '')
+    .replace(/\s*[-–·]\s*\d+.*$/gi, '')
     .trim();
 
   if (!cleanTitle || cleanTitle.length < 3) return 'Other';
