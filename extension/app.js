@@ -1078,8 +1078,8 @@ function generateWeeklyGroupLabel(keyword) {
 // 字符串相似度计算（Jaccard 相似度：交集/并集）
 function textSimilarity(str1, str2) {
   if (!str1 || !str2) return 0;
-  const tokens1 = new Set(str1.toLowerCase().split(/[\s\-_]+/).filter(t => t.length > 1));
-  const tokens2 = new Set(str2.toLowerCase().split(/[\s\-_]+/).filter(t => t.length > 1));
+  const tokens1 = new Set(str1.toLowerCase().split(/[\s\-_]+/).filter(t => t.length > 0));
+  const tokens2 = new Set(str2.toLowerCase().split(/[\s\-_]+/).filter(t => t.length > 0));
 
   const intersection = new Set([...tokens1].filter(t => tokens2.has(t)));
   const union = new Set([...tokens1, ...tokens2]);
@@ -1088,13 +1088,12 @@ function textSimilarity(str1, str2) {
 }
 
 // 按标题相似度聚类页面
-function clusterByTitleSimilarity(pages, threshold = 0.3) {
+function clusterByTitleSimilarity(pages, threshold = 0.15) {
   if (pages.length <= 6) return [{ pages }];
 
   const clusters = [];
   const assigned = new Set();
 
-  // 按访问次数排序，高频页面作为聚类中心
   const sortedPages = [...pages].sort((a, b) => (b.weeklyVisits || 0) - (a.weeklyVisits || 0));
 
   for (const page of sortedPages) {
@@ -1103,11 +1102,9 @@ function clusterByTitleSimilarity(pages, threshold = 0.3) {
     const cluster = [page];
     assigned.add(page.normalizedUrl);
 
-    // 找到相似的未分配页面
     for (const other of sortedPages) {
       if (assigned.has(other.normalizedUrl)) continue;
 
-      // 计算与聚类中所有页面的平均相似度
       const similarities = cluster.map(c => textSimilarity(c.cleanTitle || c.title || '', other.cleanTitle || other.title || ''));
       const avgSimilarity = similarities.reduce((a, b) => a + b, 0) / similarities.length;
 
@@ -1120,7 +1117,6 @@ function clusterByTitleSimilarity(pages, threshold = 0.3) {
     clusters.push({ pages: cluster });
   }
 
-  // 如果聚类结果接近原始（比如都是单元素），则不拆分
   const avgClusterSize = clusters.reduce((s, c) => s + c.pages.length, 0) / clusters.length;
   if (avgClusterSize < 2) {
     return [{ pages }];
@@ -1133,19 +1129,86 @@ function clusterByTitleSimilarity(pages, threshold = 0.3) {
 function extractGroupLabelFromTitle(title) {
   if (!title) return 'Other';
 
-  // 去除常见后缀
   const cleanTitle = title
-    .replace(/\s*[-–|·]\s*(GitHub|YouTube|Twitter|X|LinkedIn|Reddit|Medium|Notion|Figma|Slack|Discord|ChatGPT|Claude).*$/gi, '')
-    .replace(/\s*[-–|·]\s*(Docs|Documentation|Guide|Tutorial|Help|Support).*$/gi, '')
-    .replace(/\s*[-–|·]\s*\d{4}$/gi, '') // 年份
-    .replace(/\s*\(\d+\)$/gi, '') // 括号数字
-    .replace(/\s*[-–|·]\s*\d+.*$/gi, '') // 分隔符后数字
+    .replace(/\s*[-–·]\s*(GitHub|YouTube|Twitter|X|LinkedIn|Reddit|Medium|Notion|Figma|Slack|Discord|ChatGPT|Claude).*$/gi, '')
+    .replace(/\s*[-–·]\s*(Docs|Documentation|Guide|Tutorial|Help|Support).*$/gi, '')
+    .replace(/\s*[-–·]\s*\d{4}$/gi, )
+    .replace(/\s*\(\d+\)$/gi, )
+    .replace(/\s*[-–·]\s*\d+.*$/gi, )
     .trim();
 
   if (!cleanTitle || cleanTitle.length < 3) return 'Other';
 
-  // 取前 30 个字符作为分组名
   return cleanTitle.substring(0, 30);
+}
+
+function buildWeeklyFrequentGroups(pages) {
+  if (!pages || pages.length === 0) return [];
+  const grouped = {};
+  const assigned = new Set();
+
+  for (const page of pages) {
+    if ((page.weeklyVisits || 0) < WEEKLY_MIN_VISITS && page.source !== 'manual') {
+      continue;
+    }
+
+    const hostname = page.hostname || 'unknown';
+    const mainDomain = hostname.replace(/^www\./, '');
+
+    if (!grouped[mainDomain]) {
+      grouped[mainDomain] = { id: `domain:${mainDomain}`, autoLabel: friendlyDomain(hostname), label: friendlyDomain(hostname), pages: [], source: 'domain' };
+    }
+    grouped[mainDomain].pages.push(page);
+    assigned.add(page.normalizedUrl);
+  }
+
+  const result = [];
+  for (const domain of Object.keys(grouped)) {
+    const group = grouped[domain];
+
+    if (group.pages.length > 6) {
+      const clusters = clusterByTitleSimilarity(group.pages);
+
+      for (let i = 0; i < clusters.length; i++) {
+        const clusterPages = clusters[i].pages;
+
+        const bestPage = clusterPages.sort((a, b) => (b.weeklyVisits || 0) - (a.weeklyVisits || 0))[0];
+        const clusterLabel = extractGroupLabelFromTitle(bestPage.cleanTitle || bestPage.title || '');
+
+        const clusterId = `domain:${domain}:cluster:${i}`;
+
+        result.push({
+          id: clusterId,
+          autoLabel: clusterLabel,
+          label: clusterLabel,
+          pages: clusterPages,
+          score: clusterPages.reduce((s, p) => s + (p.weeklyVisits || 0), 0),
+          source: 'domain-cluster',
+        });
+      }
+    } else {
+      result.push(group);
+    }
+  }
+
+  for (const group of result) {
+    const titleToBestPage = new Map();
+    for (const page of group.pages) {
+      const titleKey = page.cleanTitle || page.title || "";
+      const existing = titleToBestPage.get(titleKey);
+      const isBetter = !existing ||
+                     page.source === 'manual' ||
+                     (page.weeklyVisits || 0) > (existing.weeklyVisits || 0) ||
+                     ((page.weeklyVisits || 0) === (existing.weeklyVisits || 0) && page.lastVisitTime > existing.lastVisitTime);
+      if (isBetter) {
+        titleToBestPage.set(titleKey, page);
+      }
+    }
+    group.pages = Array.from(titleToBestPage.values());
+    group.score = group.pages.reduce((s, p) => s + (p.weeklyVisits || 0), 0);
+  }
+
+  return result.sort((a, b) => (b.score || 0) - (a.score || 0));
 }
 
 function buildKeywordClusters(pages) {
