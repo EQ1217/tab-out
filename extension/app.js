@@ -1075,6 +1075,79 @@ function generateWeeklyGroupLabel(keyword) {
   return `${keyword} 相关`;
 }
 
+// 字符串相似度计算（Jaccard 相似度：交集/并集）
+function textSimilarity(str1, str2) {
+  if (!str1 || !str2) return 0;
+  const tokens1 = new Set(str1.toLowerCase().split(/[\s\-_]+/).filter(t => t.length > 1));
+  const tokens2 = new Set(str2.toLowerCase().split(/[\s\-_]+/).filter(t => t.length > 1));
+
+  const intersection = new Set([...tokens1].filter(t => tokens2.has(t)));
+  const union = new Set([...tokens1, ...tokens2]);
+
+  return union.size > 0 ? intersection.size / union.size : 0;
+}
+
+// 按标题相似度聚类页面
+function clusterByTitleSimilarity(pages, threshold = 0.3) {
+  if (pages.length <= 6) return [{ pages }];
+
+  const clusters = [];
+  const assigned = new Set();
+
+  // 按访问次数排序，高频页面作为聚类中心
+  const sortedPages = [...pages].sort((a, b) => (b.weeklyVisits || 0) - (a.weeklyVisits || 0));
+
+  for (const page of sortedPages) {
+    if (assigned.has(page.normalizedUrl)) continue;
+
+    const cluster = [page];
+    assigned.add(page.normalizedUrl);
+
+    // 找到相似的未分配页面
+    for (const other of sortedPages) {
+      if (assigned.has(other.normalizedUrl)) continue;
+
+      // 计算与聚类中所有页面的平均相似度
+      const similarities = cluster.map(c => textSimilarity(c.cleanTitle || c.title || '', other.cleanTitle || other.title || ''));
+      const avgSimilarity = similarities.reduce((a, b) => a + b, 0) / similarities.length;
+
+      if (avgSimilarity >= threshold) {
+        cluster.push(other);
+        assigned.add(other.normalizedUrl);
+      }
+    }
+
+    clusters.push({ pages: cluster });
+  }
+
+  // 如果聚类结果接近原始（比如都是单元素），则不拆分
+  const avgClusterSize = clusters.reduce((s, c) => s + c.pages.length, 0) / clusters.length;
+  if (avgClusterSize < 2) {
+    return [{ pages }];
+  }
+
+  return clusters;
+}
+
+// 从页面标题中提取分组名称
+function extractGroupLabelFromTitle(title) {
+  if (!title) return 'Other';
+
+  // 去除常见后缀
+  const cleanTitle = title
+    .replace(/\s*[-–|·]\s*(GitHub|YouTube|Twitter|X|LinkedIn|Reddit|Medium|Notion|Figma|Slack|Discord|ChatGPT|Claude).*$/gi, '')
+    .replace(/\s*[-–|·]\s*(Docs|Documentation|Guide|Tutorial|Help|Support).*$/gi, '')
+    .replace(/\s*[-–|·]\s*\d{4}$/gi, '') // 年份
+    .replace(/\s*\(\d+\)$/gi, '') // 括号数字
+    .replace(/\s*[-–|·]\s*\d+.*$/gi, '') // 分隔符后数字
+    .trim();
+
+  if (!cleanTitle || cleanTitle.length < 3) return 'Other';
+
+  // 取前 30 个字符作为分组名
+  return cleanTitle.substring(0, 30);
+}
+
 function buildKeywordClusters(pages) {
   if (pages.length === 0) return [];
 
@@ -1117,43 +1190,59 @@ function buildWeeklyFrequentGroups(pages) {
   const grouped = {};
   const assigned = new Set();
 
+  // 按主域名分组
   for (const page of pages) {
     // 只保留高频页面（≥10次）
     if ((page.weeklyVisits || 0) < WEEKLY_MIN_VISITS && page.source !== 'manual') {
       continue;
     }
 
-    const match = classifyWeeklyPage(page);
-    if (match) {
-      const cid = match.categoryId;
-      if (!grouped[cid]) grouped[cid] = { id: cid, autoLabel: match.label, label: match.label, pages: [], source: 'rule' };
-      grouped[cid].pages.push(page);
-      grouped[cid].score = (grouped[cid].score || 0) + match.score;
-      assigned.add(page.normalizedUrl);
+    // 使用主域名作为分组 key
+    const hostname = page.hostname || 'unknown';
+    const mainDomain = hostname.replace(/^www\./, '');
+
+    if (!grouped[mainDomain]) {
+      grouped[mainDomain] = { id: `domain:${mainDomain}`, autoLabel: friendlyDomain(hostname), label: friendlyDomain(hostname), pages: [], source: 'domain' };
+    }
+    grouped[mainDomain].pages.push(page);
+    assigned.add(page.normalizedUrl);
+  }
+
+  // 处理每个域名分组：如果超过 6 个页面，按标题相似度拆分
+  const result = [];
+  for (const domain of Object.keys(grouped)) {
+    const group = grouped[domain];
+
+    if (group.pages.length > 6) {
+      // 按标题相似度拆分
+      const clusters = clusterByTitleSimilarity(group.pages);
+
+      for (let i = 0; i < clusters.length; i++) {
+        const clusterPages = clusters[i].pages;
+
+        // 从该聚类中访问次数最高的页面提取分组名
+        const bestPage = clusterPages.sort((a, b) => (b.weeklyVisits || 0) - (a.weeklyVisits || 0))[0];
+        const clusterLabel = extractGroupLabelFromTitle(bestPage.cleanTitle || bestPage.title || '');
+
+        const clusterId = `domain:${domain}:cluster:${i}`;
+
+        result.push({
+          id: clusterId,
+          autoLabel: clusterLabel,
+          label: clusterLabel,
+          pages: clusterPages,
+          score: clusterPages.reduce((s, p) => s + (p.weeklyVisits || 0), 0),
+          source: 'domain-cluster',
+        });
+      }
+    } else {
+      // 不需要拆分，直接使用域名作为分组
+      result.push(group);
     }
   }
 
-  const unclassified = pages.filter(p => !assigned.has(p.normalizedUrl) && ((p.weeklyVisits || 0) >= WEEKLY_MIN_VISITS || p.source === 'manual'));
-  const clusters = buildKeywordClusters(unclassified);
-  for (const cl of clusters) {
-    grouped[cl.id] = cl;
-    for (const page of cl.pages) assigned.add(page.normalizedUrl);
-  }
-
-  const leftOver = pages.filter(p => !assigned.has(p.normalizedUrl) && ((p.weeklyVisits || 0) >= WEEKLY_MIN_VISITS || p.source === 'manual'));
-  if (leftOver.length > 0) {
-    grouped['other'] = {
-      id: 'other',
-      autoLabel: 'Other frequent pages',
-      label: 'Other frequent pages',
-      pages: leftOver,
-      score: leftOver.reduce((s, p) => s + (p.weeklyVisits || 1), 0),
-      source: 'other',
-    };
-  }
-
-  const result = [];
-  for (const group of Object.values(grouped)) {
+  // 去重：按标题保留最佳页面
+  for (const group of result) {
     const titleToBestPage = new Map();
     for (const page of group.pages) {
       const titleKey = page.cleanTitle || page.title || "";
@@ -1166,16 +1255,8 @@ function buildWeeklyFrequentGroups(pages) {
         titleToBestPage.set(titleKey, page);
       }
     }
-    const bestPages = Array.from(titleToBestPage.values());
-    const totalVisits = bestPages.reduce((s, p) => s + (p.weeklyVisits || 0), 0);
-    result.push({
-      id: group.id,
-      autoLabel: group.autoLabel,
-      label: group.label,
-      pages: bestPages,
-      score: totalVisits,
-      source: group.source,
-    });
+    group.pages = Array.from(titleToBestPage.values());
+    group.score = group.pages.reduce((s, p) => s + (p.weeklyVisits || 0), 0);
   }
 
   return result.sort((a, b) => (b.score || 0) - (a.score || 0));
