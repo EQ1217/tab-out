@@ -24,6 +24,10 @@ The agent will walk you through it. Takes about 1 minute.
 
 - **See all your tabs at a glance** on a clean grid, grouped by domain
 - **Homepages group** pulls Gmail inbox, X home, YouTube, LinkedIn, GitHub homepages into one card
+- **High frequency this week** shows your most-visited pages from the last 7 days, auto-grouped by domain and keywords (e.g. "GitHub 招聘", "Figma 设计")
+- **Incremental grouping** once grouped, your manual adjustments are frozen — new pages are matched to existing groups or create new ones, your edits persist across browser restarts
+- **Custom groups** create your own groups and add URLs; titles are auto-fetched from your local browsing history
+- **Delete once, gone for good** deleted groups remember their domain so they won't reappear on refresh
 - **Close tabs with style** with swoosh sound + confetti burst
 - **Duplicate detection** flags when you have the same page open twice, with one-click cleanup
 - **Click any tab to jump to it** across windows, no new tab opened
@@ -62,6 +66,9 @@ You'll see Tab Out.
 You open a new tab
   -> Tab Out shows your open tabs grouped by domain
   -> Homepages (Gmail, X, etc.) get their own group at the top
+  -> High frequency pages from the last 7 days are auto-grouped by domain + keywords
+  -> Your manual adjustments (rename, move, delete) are saved and persist
+  -> New pages are incrementally matched to existing groups
   -> Click any tab title to jump to it
   -> Close groups you're done with (swoosh + confetti)
   -> Save tabs for later before closing them
