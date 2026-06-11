@@ -699,7 +699,7 @@ function smartTitle(title, url) {
 const WEEKLY_HISTORY_DAYS = 7;
 const WEEKLY_CACHE_TTL_MS = 15 * 60 * 1000;
 const WEEKLY_MAX_RESULTS = 300;
-const WEEKLY_MIN_VISITS = 3;
+const WEEKLY_MIN_VISITS = 5;
 const WEEKLY_MAX_PAGES = 50;
 
 const WEEKLY_CATEGORY_RULES = [
@@ -1087,6 +1087,60 @@ function textSimilarity(str1, str2) {
   return union.size > 0 ? intersection.size / union.size : 0;
 }
 
+// 按标题中的高频关键词对页面做二次分组
+function clusterByTitleKeywords(pages) {
+  if (pages.length <= 6) return [{ pages }];
+
+  // 统计所有页面的关键词出现频次
+  const kwToPages = new Map();
+  for (const page of pages) {
+    const keywords = extractWeeklyKeywords(page, 1);
+    for (const { token } of keywords) {
+      if (!kwToPages.has(token)) kwToPages.set(token, []);
+      kwToPages.get(token).push(page);
+    }
+  }
+
+  // 按命中页面数降序排列，只保留 ≥2 页面命中的关键词
+  const sortedKw = [...kwToPages.entries()]
+    .filter(([, pList]) => pList.length >= 2)
+    .sort((a, b) => b[1].length - a[1].length);
+
+  if (sortedKw.length === 0) return null; // 没有关键词能聚合，降级
+
+  const assigned = new Set();
+  const clusters = [];
+
+  for (const [keyword, kwPages] of sortedKw) {
+    const unassigned = kwPages.filter(p => !assigned.has(p.normalizedUrl));
+    if (unassigned.length < 2) continue;
+
+    for (const p of unassigned) assigned.add(p.normalizedUrl);
+
+    // 从关键词生成可读标签：首字母大写，中文保持
+    const label = keyword.length <= 4 ? capitalize(keyword) : keyword;
+    clusters.push({ pages: unassigned, keyword, label });
+  }
+
+  // 未被任何关键词命中的页面
+  const remaining = pages.filter(p => !assigned.has(p.normalizedUrl));
+  if (remaining.length > 0) {
+    if (remaining.length > 6) {
+      // 剩余太多，按每 6 个一组切
+      for (let k = 0; k < remaining.length; k += 6) {
+        clusters.push({ pages: remaining.slice(k, k + 6), keyword: null, label: null });
+      }
+    } else {
+      clusters.push({ pages: remaining, keyword: null, label: null });
+    }
+  }
+
+  // 如果聚类结果只有 1 个大组且 >6，降级返回 null
+  if (clusters.length === 1 && clusters[0].pages.length > 6) return null;
+
+  return clusters;
+}
+
 // 按标题相似度聚类页面
 function clusterByTitleSimilarity(pages, threshold = 0.15) {
   if (pages.length <= 6) return [{ pages }];
@@ -1251,16 +1305,13 @@ function buildKeywordClusters(pages) {
 function buildWeeklyFrequentGroups(pages) {
   if (!pages || pages.length === 0) return [];
   const grouped = {};
-  const assigned = new Set();
 
   // 按主域名分组
   for (const page of pages) {
-    // 只保留高频页面（≥10次）
     if ((page.weeklyVisits || 0) < WEEKLY_MIN_VISITS && page.source !== 'manual') {
       continue;
     }
 
-    // 使用主域名作为分组 key
     const hostname = page.hostname || 'unknown';
     const mainDomain = hostname.replace(/^www\./, '');
 
@@ -1268,29 +1319,29 @@ function buildWeeklyFrequentGroups(pages) {
       grouped[mainDomain] = { id: `domain:${mainDomain}`, autoLabel: friendlyDomain(hostname), label: friendlyDomain(hostname), pages: [], source: 'domain' };
     }
     grouped[mainDomain].pages.push(page);
-    assigned.add(page.normalizedUrl);
   }
 
-  // 处理每个域名分组：如果超过 6 个页面，按标题相似度拆分
+  // 拆分大分组（>6 页面）
   const result = [];
   for (const domain of Object.keys(grouped)) {
     const group = grouped[domain];
 
     if (group.pages.length > 6) {
-      // 按标题相似度拆分
-      const clusters = clusterByTitleSimilarity(group.pages);
+      // 优先按关键词拆分，降级走相似度聚类
+      const clusters = clusterByTitleKeywords(group.pages) || clusterByTitleSimilarity(group.pages);
+      const domainLabel = friendlyDomain(group.pages[0].hostname || domain);
 
       for (let i = 0; i < clusters.length; i++) {
         const clusterPages = clusters[i].pages;
+        const bestPage = [...clusterPages].sort((a, b) => (b.weeklyVisits || 0) - (a.weeklyVisits || 0))[0];
 
-        // 从该聚类中访问次数最高的页面提取分组名
-        const bestPage = clusterPages.sort((a, b) => (b.weeklyVisits || 0) - (a.weeklyVisits || 0))[0];
-        const clusterLabel = extractGroupLabelFromTitle(bestPage.cleanTitle || bestPage.title || '');
-
-        const clusterId = `domain:${domain}:cluster:${i}`;
+        // 关键词分组：域名 + 关键词标签；相似度分组：从标题提取
+        const clusterLabel = clusters[i].keyword
+          ? `${domainLabel} ${clusters[i].label}`
+          : extractGroupLabelFromTitle(bestPage.cleanTitle || bestPage.title || '');
 
         result.push({
-          id: clusterId,
+          id: `domain:${domain}:cluster:${i}`,
           autoLabel: clusterLabel,
           label: clusterLabel,
           pages: clusterPages,
@@ -1299,7 +1350,6 @@ function buildWeeklyFrequentGroups(pages) {
         });
       }
     } else {
-      // 不需要拆分，直接使用域名作为分组
       result.push(group);
     }
   }
@@ -1320,6 +1370,65 @@ function buildWeeklyFrequentGroups(pages) {
     }
     group.pages = Array.from(titleToBestPage.values());
     group.score = group.pages.reduce((s, p) => s + (p.weeklyVisits || 0), 0);
+  }
+
+  // 二次拆分：去重后仍 >6 的组，强制按 6 个切分
+  for (let i = result.length - 1; i >= 0; i--) {
+    if (result[i].pages.length > 6) {
+      const bigGroup = result.splice(i, 1)[0];
+      const allPages = bigGroup.pages;
+      for (let k = 0; k < allPages.length; k += 6) {
+        const chunk = allPages.slice(k, k + 6);
+        const bestPage = [...chunk].sort((a, b) => (b.weeklyVisits || 0) - (a.weeklyVisits || 0))[0];
+        result.push({
+          id: `${bigGroup.id}:chunk:${k / 6}`,
+          autoLabel: extractGroupLabelFromTitle(bestPage.cleanTitle || bestPage.title || ''),
+          label: extractGroupLabelFromTitle(bestPage.cleanTitle || bestPage.title || ''),
+          pages: chunk,
+          score: chunk.reduce((s, p) => s + (p.weeklyVisits || 0), 0),
+          source: bigGroup.source,
+        });
+      }
+    }
+  }
+
+  // 合并只有 1 个 URL 的分组为 "Other"
+  const singleGroups = result.filter(g => g.pages.length === 1);
+  if (singleGroups.length >= 2) {
+    const otherPages = singleGroups.flatMap(g => g.pages);
+    const otherScore = otherPages.reduce((s, p) => s + (p.weeklyVisits || 0), 0);
+    for (const sg of singleGroups) {
+      const idx = result.indexOf(sg);
+      if (idx !== -1) result.splice(idx, 1);
+    }
+    result.push({
+      id: 'other:singles',
+      autoLabel: 'Other',
+      label: 'Other',
+      pages: otherPages,
+      score: otherScore,
+      source: 'other',
+    });
+  }
+
+  // 最终整理：合并单URL后 "Other" 可能 >6，再切分
+  for (let i = result.length - 1; i >= 0; i--) {
+    if (result[i].pages.length > 6) {
+      const bigGroup = result.splice(i, 1)[0];
+      const allPages = bigGroup.pages;
+      for (let k = 0; k < allPages.length; k += 6) {
+        const chunk = allPages.slice(k, k + 6);
+        const bestPage = [...chunk].sort((a, b) => (b.weeklyVisits || 0) - (a.weeklyVisits || 0))[0];
+        result.push({
+          id: `${bigGroup.id}:chunk:${k / 6}`,
+          autoLabel: extractGroupLabelFromTitle(bestPage.cleanTitle || bestPage.title || ''),
+          label: extractGroupLabelFromTitle(bestPage.cleanTitle || bestPage.title || ''),
+          pages: chunk,
+          score: chunk.reduce((s, p) => s + (p.weeklyVisits || 0), 0),
+          source: bigGroup.source,
+        });
+      }
+    }
   }
 
   return result.sort((a, b) => (b.score || 0) - (a.score || 0));
@@ -1346,6 +1455,10 @@ function getWeeklyPagePrefs() {
         manualUrls: {},
         urlToCategory: {},
         removedCategories: [],
+        customGroups: {},
+        groupDefs: {},
+        removedUrls: [],
+        removedDomains: [],
       };
       resolve(prefs);
     });
@@ -1425,6 +1538,34 @@ function applyWeeklyPrefs(groups, prefs) {
     result.push(updatedGroup);
   }
 
+  // 添加用户手动创建的分组（需在 catsWithManuals 之前，避免重复创建）
+  if (prefs.customGroups) {
+    for (const [groupId, groupData] of Object.entries(prefs.customGroups)) {
+      if (prefs.removedCategories && prefs.removedCategories.includes(groupId)) continue;
+
+      const manualPages = [];
+      for (const [url, catId] of Object.entries(prefs.urlToCategory)) {
+        if (catId === groupId && prefs.manualUrls[url]) {
+          manualPages.push({
+            ...prefs.manualUrls[url],
+            url: url,
+            normalizedUrl: normalizeHistoryUrl(url),
+            source: 'manual',
+          });
+        }
+      }
+
+      result.push({
+        id: groupId,
+        autoLabel: groupData.label || 'New Group',
+        label: prefs.customLabels[groupId] || groupData.label || 'New Group',
+        pages: sortWeeklyPages(manualPages),
+        score: manualPages.reduce((s, p) => s + (p.weeklyVisits || 1), 0),
+        source: 'custom',
+      });
+    }
+  }
+
   // 添加只有手动 URL 的分类
   const catsWithManuals = new Set(Object.values(prefs.urlToCategory));
   for (const catId of catsWithManuals) {
@@ -1487,6 +1628,37 @@ function deleteWeeklyGroup(groupId) {
       removed.push(groupId);
     }
     prefs.removedCategories = removed;
+    // 同时清理 customGroups 和 groupDefs
+    if (prefs.customGroups && prefs.customGroups[groupId]) {
+      delete prefs.customGroups[groupId];
+    }
+    if (prefs.groupDefs && prefs.groupDefs[groupId]) {
+      delete prefs.groupDefs[groupId];
+    }
+    // 记住被删除分组的域名，防止新页面自动归堆回来
+    const def = (prefs.groupDefs && prefs.groupDefs[groupId]) || {};
+    if (def.domain) {
+      prefs.removedDomains = prefs.removedDomains || [];
+      if (!prefs.removedDomains.includes(def.domain)) {
+        prefs.removedDomains.push(def.domain);
+      }
+    }
+    // 从 groupId 提取域名（domain:xxx 格式）
+    if (groupId.startsWith('domain:')) {
+      const domain = groupId.slice(7).split(/:(cluster|sub|chunk):/)[0];
+      prefs.removedDomains = prefs.removedDomains || [];
+      if (!prefs.removedDomains.includes(domain)) {
+        prefs.removedDomains.push(domain);
+      }
+    }
+    // 清理 urlToCategory 中属于此组的映射
+    if (prefs.urlToCategory) {
+      for (const url of Object.keys(prefs.urlToCategory)) {
+        if (prefs.urlToCategory[url] === groupId) {
+          delete prefs.urlToCategory[url];
+        }
+      }
+    }
     return saveWeeklyPagePrefs(prefs);
   });
 }
@@ -1496,6 +1668,11 @@ function removeWeeklyUrl(url) {
     const normalized = normalizeHistoryUrl(url);
     delete prefs.manualUrls[normalized];
     delete prefs.urlToCategory[normalized];
+    // 加入黑名单，防止下次自动归堆回来
+    prefs.removedUrls = prefs.removedUrls || [];
+    if (!prefs.removedUrls.includes(normalized)) {
+      prefs.removedUrls.push(normalized);
+    }
     return saveWeeklyPagePrefs(prefs);
   });
 }
@@ -1509,23 +1686,236 @@ function saveWeeklyGroupTitle(groupId, newLabel) {
 }
 
 function addWeeklyUrlToCategory(url, categoryId) {
-  return getWeeklyPagePrefs().then(prefs => {
+  return new Promise((resolve) => {
     const normalized = normalizeHistoryUrl(url);
-    prefs.manualUrls = prefs.manualUrls || {};
-    prefs.urlToCategory = prefs.urlToCategory || {};
+    let parsedUrl;
+    try { parsedUrl = new URL(url); } catch { parsedUrl = null; }
 
-    prefs.manualUrls[normalized] = {
-      title: url,
-      cleanTitle: cleanTitle(url),
-      hostname: new URL(url).hostname,
-      pathname: new URL(url).pathname,
-      lastVisitTime: Date.now(),
-      weeklyVisits: 1,
-    };
-    prefs.urlToCategory[normalized] = categoryId;
+    // 先从本地浏览历史里查标题
+    chrome.history.search({ text: url, maxResults: 1, startTime: 0 }, (results) => {
+      const historyItem = results && results[0];
+      const title = (historyItem && historyItem.title) || '';
+      const displayTitle = title || (parsedUrl ? parsedUrl.hostname + parsedUrl.pathname : url);
 
-    return saveWeeklyPagePrefs(prefs);
+      getWeeklyPagePrefs().then(prefs => {
+        prefs.manualUrls = prefs.manualUrls || {};
+        prefs.urlToCategory = prefs.urlToCategory || {};
+
+        prefs.manualUrls[normalized] = {
+          title: displayTitle,
+          cleanTitle: cleanTitle(displayTitle),
+          hostname: parsedUrl ? parsedUrl.hostname : '',
+          pathname: parsedUrl ? parsedUrl.pathname : '',
+          lastVisitTime: historyItem ? historyItem.lastVisitTime || Date.now() : Date.now(),
+          weeklyVisits: (historyItem && historyItem.visitCount) || 1,
+        };
+        prefs.urlToCategory[normalized] = categoryId;
+
+        saveWeeklyPagePrefs(prefs).then(resolve);
+      });
+    });
   });
+}
+
+/* ----------------------------------------------------------------
+   WEEKLY INCREMENTAL GROUPING
+   ---------------------------------------------------------------- */
+
+// 增量分组：基于已冻结的分组结构，只对新增 URL 做匹配
+function rebuildWithNewPages(pages, prefs) {
+  const groupDefs = prefs.groupDefs || {};
+  const urlToCategory = prefs.urlToCategory || {};
+  const manualUrls = prefs.manualUrls || {};
+  const customLabels = prefs.customLabels || {};
+  const removedCategories = prefs.removedCategories || [];
+  const removedUrls = prefs.removedUrls || [];
+  const customGroups = prefs.customGroups || {};
+
+  const result = [];
+  const assignedUrls = new Set();
+
+  // 1. 从冻结的分组定义重建已有分组
+  for (const [groupId, def] of Object.entries(groupDefs)) {
+    if (removedCategories.includes(groupId)) continue;
+
+    const groupPages = [];
+
+    // 当前历史中的页面，已在 urlToCategory 中分配到此组
+    for (const page of pages) {
+      const normalized = page.normalizedUrl;
+      if (removedUrls.includes(normalized)) continue;
+      if (urlToCategory[normalized] === groupId) {
+        groupPages.push(page);
+        assignedUrls.add(normalized);
+      }
+    }
+
+    // 手动添加的页面
+    for (const [url, catId] of Object.entries(urlToCategory)) {
+      if (catId === groupId && manualUrls[url] && !assignedUrls.has(url)) {
+        groupPages.push({
+          ...manualUrls[url],
+          url: url,
+          normalizedUrl: normalizeHistoryUrl(url),
+          source: 'manual',
+        });
+        assignedUrls.add(url);
+      }
+    }
+
+    // 保留有页面的组，或用户创建的空组
+    if (groupPages.length > 0 || customGroups[groupId]) {
+      result.push({
+        id: groupId,
+        autoLabel: def.label,
+        label: customLabels[groupId] || def.label,
+        pages: sortWeeklyPages(groupPages),
+        score: groupPages.reduce((s, p) => s + (p.weeklyVisits || 1), 0),
+        source: def.source || 'domain',
+      });
+    }
+  }
+
+  // 2. 添加 customGroups 中尚未在 groupDefs 里的新组
+  for (const [groupId, groupData] of Object.entries(customGroups)) {
+    if (removedCategories.includes(groupId)) continue;
+    if (result.some(g => g.id === groupId)) continue;
+
+    const groupPages = [];
+    for (const [url, catId] of Object.entries(urlToCategory)) {
+      if (catId === groupId && manualUrls[url]) {
+        groupPages.push({
+          ...manualUrls[url],
+          url: url,
+          normalizedUrl: normalizeHistoryUrl(url),
+          source: 'manual',
+        });
+        assignedUrls.add(url);
+      }
+    }
+
+    result.push({
+      id: groupId,
+      autoLabel: groupData.label || 'New Group',
+      label: customLabels[groupId] || groupData.label || 'New Group',
+      pages: sortWeeklyPages(groupPages),
+      score: groupPages.reduce((s, p) => s + (p.weeklyVisits || 1), 0),
+      source: 'custom',
+    });
+  }
+
+  // 3. 找出未分配到任何组的新页面
+  const removedDomains = prefs.removedDomains || [];
+  const newPages = pages.filter(p => {
+    const normalized = p.normalizedUrl;
+    const mainDomain = (p.hostname || 'unknown').replace(/^www\./, '');
+    return !assignedUrls.has(normalized) &&
+           !removedUrls.includes(normalized) &&
+           !removedDomains.includes(mainDomain) &&
+           ((p.weeklyVisits || 0) >= WEEKLY_MIN_VISITS || p.source === 'manual');
+  });
+
+  if (newPages.length > 0) {
+    // 先按域名匹配到已有分组
+    const unmatched = [];
+    for (const page of newPages) {
+      const mainDomain = (page.hostname || 'unknown').replace(/^www\./, '');
+      let matched = false;
+      for (const group of result) {
+        const def = groupDefs[group.id];
+        if (def && def.domain === mainDomain) {
+          group.pages.push(page);
+          group.score += page.weeklyVisits || 1;
+          assignedUrls.add(page.normalizedUrl);
+          matched = true;
+          break;
+        }
+      }
+      if (!matched) unmatched.push(page);
+    }
+
+    // 排序已修改组的页面
+    for (const group of result) {
+      group.pages = sortWeeklyPages(group.pages);
+    }
+
+    // 剩余未匹配的页面走自动分组
+    if (unmatched.length > 0) {
+      const newGroups = buildWeeklyFrequentGroups(unmatched);
+      result.push(...newGroups);
+    }
+  }
+
+  // 4. 合并只有 1 个 URL 的自动分组为 "Other"（用户手动创建的不合并）
+  const singleGroups = result.filter(g => g.pages.length === 1 && g.source !== 'custom');
+  if (singleGroups.length >= 2) {
+    const otherPages = singleGroups.flatMap(g => g.pages);
+    const otherScore = otherPages.reduce((s, p) => s + (p.weeklyVisits || 0), 0);
+    for (const sg of singleGroups) {
+      const idx = result.indexOf(sg);
+      if (idx !== -1) result.splice(idx, 1);
+    }
+    result.push({
+      id: 'other:singles',
+      autoLabel: 'Other',
+      label: 'Other',
+      pages: otherPages,
+      score: otherScore,
+      source: 'other',
+    });
+  }
+
+  // 5. >6 的组强制按 6 个切分
+  for (let i = result.length - 1; i >= 0; i--) {
+    if (result[i].pages.length > 6) {
+      const bigGroup = result.splice(i, 1)[0];
+      const allPages = bigGroup.pages;
+      for (let k = 0; k < allPages.length; k += 6) {
+        const chunk = allPages.slice(k, k + 6);
+        const bestPage = [...chunk].sort((a, b) => (b.weeklyVisits || 0) - (a.weeklyVisits || 0))[0];
+        result.push({
+          id: `${bigGroup.id}:chunk:${k / 6}`,
+          autoLabel: extractGroupLabelFromTitle(bestPage.cleanTitle || bestPage.title || ''),
+          label: extractGroupLabelFromTitle(bestPage.cleanTitle || bestPage.title || ''),
+          pages: chunk,
+          score: chunk.reduce((s, p) => s + (p.weeklyVisits || 0), 0),
+          source: bigGroup.source,
+        });
+      }
+    }
+  }
+
+  return sortWeeklyGroups(result);
+}
+
+// 将当前分组结构持久化到 prefs，下次加载时直接复用
+async function persistGroupDefs(groups, prefs) {
+  const groupDefs = {};
+  const urlToCategory = prefs.urlToCategory || {};
+
+  for (const group of groups) {
+    // 提取域名用于新页面匹配
+    let domain = '';
+    if (group.id.startsWith('domain:')) {
+      const rest = group.id.slice(7);
+      domain = rest.split(/:(cluster|sub|chunk):/)[0];
+    }
+
+    groupDefs[group.id] = {
+      label: group.autoLabel || group.label,
+      domain: domain,
+      source: group.source,
+    };
+
+    for (const page of group.pages) {
+      const normalized = page.normalizedUrl || normalizeHistoryUrl(page.url);
+      urlToCategory[normalized] = group.id;
+    }
+  }
+
+  prefs.groupDefs = groupDefs;
+  prefs.urlToCategory = urlToCategory;
+  await saveWeeklyPagePrefs(prefs);
 }
 
 /* ----------------------------------------------------------------
@@ -1541,9 +1931,20 @@ async function getWeeklyFrequentData(forceRefresh = false) {
   }
 
   const pages = await fetchWeeklyHistoryPages();
-  const rawGroups = buildWeeklyFrequentGroups(pages);
   const prefs = await getWeeklyPagePrefs();
-  const groups = applyWeeklyPrefs(rawGroups, prefs);
+
+  let groups;
+  if (prefs.groupDefs && Object.keys(prefs.groupDefs).length > 0) {
+    // 后续加载：冻结已有分组，只对新增 URL 做增量匹配
+    groups = rebuildWithNewPages(pages, prefs);
+  } else {
+    // 首次加载：完整自动分组
+    const rawGroups = buildWeeklyFrequentGroups(pages);
+    groups = applyWeeklyPrefs(rawGroups, prefs);
+  }
+
+  // 持久化分组结构，下次加载时复用
+  await persistGroupDefs(groups, prefs);
 
   await saveWeeklyFrequentCache(groups);
   return groups;
@@ -1572,7 +1973,13 @@ function renderWeeklyFrequentSection(groups) {
   section.style.display = 'block';
   if (countEl) countEl.textContent = `${totalGroups} groups · ${totalPages} pages`;
 
-  missionsEl.innerHTML = groups.map(group => renderWeeklyFrequentCard(group)).join('');
+  missionsEl.innerHTML = groups.map(group => renderWeeklyFrequentCard(group)).join('') +
+    `<button class="action-btn weekly-add-group-btn" data-action="create-weekly-group" title="Create a new group">
+      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width:15px;height:15px;">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+      </svg>
+      New group
+    </button>`;
 
   if (emptyEl) emptyEl.style.display = 'none';
 }
@@ -1592,7 +1999,7 @@ function renderWeeklyFrequentCard(group) {
       <span class="mission-name">${safeLabel}</span>
       <span class="mission-tag neutral">${totalVisits} visits</span>
       <button class="weekly-card-close" data-action="delete-weekly-group" data-group-id="${safeId}" title="Delete this category">
-        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor">
           <path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" />
         </svg>
       </button>
@@ -1785,9 +2192,18 @@ function renderDomainCard(group) {
   const hasDupes   = dupeUrls.length > 0;
   const totalExtras = dupeUrls.reduce((s, [, c]) => s + c - 1, 0);
 
+  // Deduplicate for display: show each URL once, with (Nx) badge if duped
+  const seen = new Set();
+  const uniqueTabs = [];
+  for (const tab of tabs) {
+    if (!seen.has(tab.url)) { seen.add(tab.url); uniqueTabs.push(tab); }
+  }
+
+  const uniqueCount = uniqueTabs.length;
+
   const tabBadge = `<span class="open-tabs-badge">
     ${ICONS.tabs}
-    ${tabCount} tab${tabCount !== 1 ? 's' : ''} open
+    ${uniqueCount} page${uniqueCount !== 1 ? 's' : ''}${hasDupes ? ` (${tabCount} tabs)` : ''}
   </span>`;
 
   const dupeBadge = hasDupes
@@ -1795,13 +2211,6 @@ function renderDomainCard(group) {
         ${totalExtras} duplicate${totalExtras !== 1 ? 's' : ''}
       </span>`
     : '';
-
-  // Deduplicate for display: show each URL once, with (Nx) badge if duped
-  const seen = new Set();
-  const uniqueTabs = [];
-  for (const tab of tabs) {
-    if (!seen.has(tab.url)) { seen.add(tab.url); uniqueTabs.push(tab); }
-  }
 
   const visibleTabs = uniqueTabs.slice(0, 8);
   const extraCount  = uniqueTabs.length - visibleTabs.length;
@@ -2690,6 +3099,24 @@ document.addEventListener('click', async (e) => {
       const input = formEl.querySelector('input');
       if (input) input.value = '';
     }
+
+    return;
+  }
+
+  // ---- Weekly: create new group ----
+  if (action === 'create-weekly-group') {
+    const label = prompt('Group name:');
+    if (!label || !label.trim()) return;
+
+    const prefs = await getWeeklyPagePrefs();
+    prefs.customGroups = prefs.customGroups || {};
+    const groupId = `custom:${Date.now()}`;
+    prefs.customGroups[groupId] = { label: label.trim(), createdAt: Date.now() };
+    await saveWeeklyPagePrefs(prefs);
+
+    const groups = await getWeeklyFrequentData(true);
+    renderWeeklyFrequentSection(groups);
+    showToast('Group created');
 
     return;
   }

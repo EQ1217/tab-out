@@ -290,7 +290,7 @@ header {
   align-items: center;
   gap: 10px;
   margin-bottom: 6px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
 }
 
 .mission-name {
@@ -298,6 +298,10 @@ header {
   font-size: 15px;
   color: var(--ink);
   letter-spacing: -0.2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .mission-tag {
@@ -1201,22 +1205,22 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
   border: none;
   color: var(--muted);
   cursor: pointer;
-  padding: 6px;
+  padding: 4px;
   border-radius: 4px;
-  opacity: 0.6;
+  opacity: 0.35;
   transition: opacity 0.15s, color 0.15s, background 0.15s;
   flex-shrink: 0;
-  margin-left: 8px;
+  margin-left: auto;
 }
 
 .weekly-card-close svg {
-  width: 22px;
-  height: 22px;
+  width: 15px;
+  height: 15px;
 }
 
 .weekly-card-close:hover {
   opacity: 1;
-  background: rgba(154, 145, 138, 0.1);
+  background: rgba(179, 90, 90, 0.08);
   color: var(--status-abandoned);
 }
 
@@ -1229,20 +1233,36 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
   border: none;
   color: var(--muted);
   cursor: pointer;
-  padding: 6px;
+  padding: 4px;
   border-radius: 4px;
-  opacity: 0.6;
+  opacity: 0.35;
   transition: opacity 0.15s, color 0.15s, background 0.15s;
   flex-shrink: 0;
 }
 
 .weekly-page-close svg {
-  width: 22px;
-  height: 22px;
+  width: 15px;
+  height: 15px;
 }
 
 .weekly-page-close:hover {
   opacity: 1;
   background: rgba(179, 90, 90, 0.08);
   color: var(--status-abandoned);
+}
+
+/* Weekly: add new group button */
+.weekly-add-group-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  color: var(--muted);
+  opacity: 0.6;
+  transition: opacity 0.15s, color 0.15s;
+}
+
+.weekly-add-group-btn:hover {
+  opacity: 1;
+  color: var(--ink);
 }
